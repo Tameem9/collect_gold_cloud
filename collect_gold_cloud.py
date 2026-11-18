@@ -61,6 +61,17 @@ result = requests.post(
 if not result.ok:
     print("Supabase HTTP status:", result.status_code)
     print("Supabase error details:", result.text[:1000])
-    result.raise_for_status()
+if not result.ok:
+    print("Supabase HTTP status:", result.status_code)
 
+    try:
+        error = result.json()
+        print("Supabase error code:", error.get("code"))
+        print("Supabase error message:", error.get("message"))
+        print("Supabase error hint:", error.get("hint"))
+    except ValueError:
+        print("Supabase returned a non-JSON error response")
+        print("Response content type:", result.headers.get("Content-Type"))
+
+    result.raise_for_status()
 print(f"Cloud collection completed for {len(rows)} karats")
