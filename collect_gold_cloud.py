@@ -58,7 +58,9 @@ result = requests.post(
     json=rows,
     timeout=30
 )
-
-result.raise_for_status()
+if not result.ok:
+    print("Supabase HTTP status:", result.status_code)
+    print("Supabase error details:", result.text[:1000])
+    result.raise_for_status()
 
 print(f"Cloud collection completed for {len(rows)} karats")
