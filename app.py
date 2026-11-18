@@ -1,98 +1,108 @@
-import pandas as pd
-import plotly.express as px
-import requests
-import streamlit as st
-
-st.set_page_config(page_title='Egypt Gold & USD Tracker', page_icon='🥇', layout='wide')
-st.title('🥇 Egyptian Gold & USD Tracker')
-st.caption('Historical gold prices from Supabase · USD/EGP spot reference')
-
-try:
-    url = st.secrets['SUPABASE_URL'].rstrip('/')
-    key = st.secrets['SUPABASE_PUBLISHABLE_KEY']
-except KeyError:
-    st.error('Configure SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY in Streamlit app secrets.')
-    st.stop()
-
-@st.cache_data(ttl=300)
-def get_gold():
-    rows = []
-    offset = 0
-    while True:
-        response = requests.get(
-            f'{url}/rest/v1/gold_price_history',
-            headers={'apikey': key, 'Authorization': f'Bearer {key}'},
-            params={'select': 'karat,currency,price_per_gram,buy_price,sell_price,collected_at,source_updated_at',
-                    'order': 'collected_at.desc', 'limit': 1000, 'offset': offset},
-            timeout=30,
-        )
-        response.raise_for_status()
-        batch = response.json()
-        rows.extend(batch)
-        if len(batch) < 1000:
-            break
-        offset += 1000
-    return pd.DataFrame(rows)
-
-@st.cache_data(ttl=3600)
-def get_usd():
-    # Public reference feed; availability and methodology may differ from bank rates.
-    response = requests.get('https://open.er-api.com/v6/latest/USD', timeout=20)
-    response.raise_for_status()
-    payload = response.json()
-    if payload.get('result') != 'success':
-        raise ValueError('FX provider returned an unsuccessful response')
-    return float(payload['rates']['EGP']), payload.get('time_last_update_utc', 'Unknown')
+# Compare the two latest distinct source updates per karat, not repeated collection runs.
+# This means the arrow compares against the previous recorded price, regardless of elapsed time.
+latest = gold.sort_values("collected_at").groupby("karat").tail(1).set_index("karat")
+previous_prices = {}
+for karat, frame in gold.groupby("karat"):
+    frame = frame.sort_values("collected_at").drop_duplicates(subset=["source_updated_at"], keep="last")
+    if len(frame) >= 2:
+        previous_prices[karat] = float(frame.iloc[-2]["display_price"])
 
 try:
-    df = get_gold()
-except Exception as exc:
-    st.error(f'Unable to read gold history from Supabase: {exc}')
-    st.stop()
-
-if df.empty:
-    st.warning('No gold prices found. Verify collector inserts and Supabase read permissions.')
-    st.stop()
-
-df['collected_at'] = pd.to_datetime(df['collected_at'], utc=True, errors='coerce')
-df['source_updated_at'] = pd.to_datetime(df['source_updated_at'], utc=True, errors='coerce')
-for col in ['karat', 'price_per_gram', 'buy_price', 'sell_price']:
-    df[col] = pd.to_numeric(df[col], errors='coerce')
-df = df.dropna(subset=['karat', 'collected_at', 'price_per_gram'])
-df = df[df['currency'] == 'EGP'].sort_values('collected_at')
-if df.empty:
-    st.warning('No valid EGP gold observations available.')
-    st.stop()
-
-latest = df.sort_values('collected_at').groupby('karat', as_index=False).tail(1)
-cols = st.columns(min(len(latest), 4))
-for i, (_, r) in enumerate(latest.sort_values('karat', ascending=False).iterrows()):
-    with cols[i % len(cols)]:
-        st.metric(f'{int(r.karat)}K Gold', f'{r.price_per_gram:,.2f} EGP/g')
-
-st.subheader('USD / EGP')
-try:
-    rate, updated = get_usd()
-    st.metric('1 USD', f'{rate:,.4f} EGP')
-    st.caption(f'FX reference last updated: {updated}. Not a bank buy/sell quotation.')
+    usd_rate, fx_updated = get_usd()
 except Exception:
-    st.info('USD/EGP reference is temporarily unavailable. Gold history is unaffected.')
+    usd_rate, fx_updated = None, "Unavailable"
 
-st.subheader('Gold price history')
-karats = sorted(df.karat.unique().tolist(), reverse=True)
-selected = st.multiselect('Select karats', karats, default=karats, format_func=lambda x: f'{int(x)}K')
-metric = st.selectbox('Price series', ['price_per_gram', 'buy_price', 'sell_price'], format_func=lambda x: x.replace('_', ' ').title())
-filtered = df[df.karat.isin(selected)].dropna(subset=[metric]).copy()
-filtered['Karat'] = filtered['karat'].astype(int).astype(str) + 'K'
-if not filtered.empty:
-    fig = px.line(filtered, x='collected_at', y=metric, color='Karat', markers=True,
-                  labels={'collected_at': 'Collection time (UTC)', metric: 'EGP per gram'})
+st.markdown(f'<div class="fx-updated"><div><small>FX reference last updated</small><strong>{html.escape(str(fx_updated))}</strong></div></div>', unsafe_allow_html=True)
+st.markdown('<div class="main-heading">Egypt Gold &amp; USD Tracker</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-subtitle">Egyptian gold prices and USD / EGP reference rate</div>', unsafe_allow_html=True)
+
+cards = []
+for karat in [24, 22, 21, 18]:
+    if karat in latest.index:
+        current = float(latest.loc[karat, "display_price"])
+        price = f"{current:,.2f}"
+        prior = previous_prices.get(karat)
+        if prior is None:
+            change, cls = "— No earlier update", "flat"
+        else:
+            difference = current - prior
+            if difference > 0:
+                change, cls = f"▲ +{difference:,.2f} EGP", "up"
+            elif difference < 0:
+                change, cls = f"▼ {difference:,.2f} EGP", "down"
+            else:
+                change, cls = "→ No change", "flat"
+    else:
+        price, change, cls = "—", "— No data", "flat"
+    cards.append((price, f"{karat}K Gold", "EGP / gram", change, cls, False))
+# The FX API supplies only the current reference rate. Do not fabricate an earlier rate.
+cards.append((f"{usd_rate:,.4f}" if usd_rate is not None else "—", "USD / EGP", "EGP", "— Previous FX rate unavailable", "flat", True))
+markup = '<div class="price-grid">'
+for price, label, unit, change, cls, is_fx in cards:
+    fx_class = " fx-card" if is_fx else ""
+    markup += (f'<div class="price-card{fx_class}"><div class="price-value">{html.escape(price)}</div>'
+               f'<div class="price-label">{html.escape(label)}</div>'
+               f'<div class="price-unit">{html.escape(unit)}</div>'
+               f'<div class="price-change {cls}">{html.escape(change)}</div></div>')
+markup += '</div>'
+
+st.markdown(markup, unsafe_allow_html=True)
+st.caption("▲/▼ compares each karat with its previous distinct recorded source update (not necessarily one hour ago). Gold uses sell prices when available. USD/EGP arrows will require historical FX collection.")
+
+st.subheader("Gold price history")
+available = sorted(gold["karat"].astype(int).unique().tolist(), reverse=True)
+selected = st.pills("Select karats", options=available, default=available, selection_mode="multi", format_func=lambda k: f"{k}K")
+period = st.segmented_control("Time grouping", ["Daily", "Monthly", "Yearly"], default="Daily")
+
+if selected:
+    chosen = gold[gold["karat"].isin(selected)].copy()
+    chosen["Karat"] = chosen["karat"].astype(int).astype(str) + "K"
+    if period == "Daily":
+        chosen["period"] = chosen["local_time"].dt.strftime("%Y-%m-%d")
+    elif period == "Monthly":
+        chosen["period"] = chosen["local_time"].dt.strftime("%Y-%m")
+    else:
+        chosen["period"] = chosen["local_time"].dt.strftime("%Y")
+
+    # Last observed sell price in each Cairo-local day/month/year (not hourly points).
+    daily = (chosen.sort_values("collected_at")
+             .groupby(["Karat", "period"], as_index=False).tail(1)
+             .sort_values(["period", "Karat"]))
+    fig = px.line(daily, x="period", y="display_price", color="Karat", markers=True,
+                  labels={"period": "Date" if period == "Daily" else "Period",
+                          "display_price": "EGP per gram"})
+    fig.update_layout(legend_title_text="Karat", hovermode="x unified", margin=dict(l=10,r=10,t=15,b=10))
+    fig.update_xaxes(type="category", title="Date" if period == "Daily" else "Period")
     st.plotly_chart(fig, use_container_width=True)
+    st.caption(f"One observation per { {'Daily': 'day', 'Monthly': 'month', 'Yearly': 'year'}[period]}: last available sell price in Egypt local time. Missing dates are not filled.")
 else:
-    st.info('No data for this selection.')
+    st.info("Choose at least one karat to view its history.")
 
-st.subheader('Historical records')
-st.dataframe(filtered.sort_values('collected_at', ascending=False), use_container_width=True, hide_index=True)
-st.download_button('Download selected gold history (CSV)', filtered.to_csv(index=False).encode('utf-8'),
-                   file_name='egypt_gold_history.csv', mime='text/csv')
-st.caption('Gold history begins when your collector started. USD/EGP history requires a separate scheduled collector.')
+st.subheader("Download gold price history")
+min_date = gold["local_date"].min()
+max_date = gold["local_date"].max()
+start_default = max(min_date, max_date - timedelta(days=365))
+from_col, to_col = st.columns(2)
+with from_col:
+    start_date = st.date_input("From", value=start_default, min_value=min_date, max_value=max_date)
+with to_col:
+    end_date = st.date_input("To", value=max_date, min_value=min_date, max_value=max_date)
+
+if start_date > end_date:
+    st.warning("The start date must be on or before the end date.")
+else:
+    export = gold[(gold["local_date"] >= start_date) & (gold["local_date"] <= end_date)].copy()
+    if selected:
+        export = export[export["karat"].isin(selected)]
+    else:
+        export = export.iloc[0:0]
+    export = export.sort_values("collected_at")
+    export["egypt_time"] = export["local_time"].dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+    columns = ["egypt_time", "karat", "currency", "display_price", "price_per_gram", "buy_price", "sell_price", "source_updated_at"]
+    csv = export[columns].to_csv(index=False).encode("utf-8-sig")
+    st.download_button("⬇ Download selected gold history (CSV)", data=csv,
+                       file_name=f"egypt_gold_{start_date}_{end_date}.csv", mime="text/csv",
+                       disabled=export.empty, use_container_width=True)
+    st.caption(f"{len(export):,} records ready to download. Raw observations are exported without displaying a table.")
+
+st.caption("Gold history starts when your collector began. Historical USD/EGP data needs a separate scheduled FX collector; this version shows the latest reference rate only.")
