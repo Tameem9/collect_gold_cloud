@@ -264,7 +264,7 @@ def style_history_chart(fig, interval_name, line_color, ylabel, height=320):
         font=dict(family='Inter, sans-serif', color='#5C5C5C', size=12),
         hovermode='x unified',
         legend=dict(orientation='h', y=1.13, x=0, font=dict(color='#5C5C5C', size=12)),
-        xaxis=dict(showgrid=False, tickformat={'Daily':'%b %d','Monthly':'%b %Y','Yearly':'%Y'}[interval_name],
+        xaxis=dict(showgrid=False, tickformat={'All updates':'%b %d %H:%M','Daily':'%b %d','Monthly':'%b %Y','Yearly':'%Y'}[interval_name],
                    linecolor='#EDEBE6', tickfont=dict(color='#8A8A8A', size=12)),
         yaxis=dict(title=dict(text=ylabel, font=dict(color='#5C5C5C', size=12)),
                    showgrid=True, gridcolor='#EDEBE6', zeroline=False,
@@ -274,43 +274,69 @@ def style_history_chart(fig, interval_name, line_color, ylabel, height=320):
 
 # Gold price history, including its original selection and CSV download logic.
 with st.container(border=True):
-    st.markdown('<div class="section-title">Gold price history</div><div class="section-caption">One closing observation per day, month or year.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Gold price history</div><div class="section-caption">Explore every collected update or compare the last price of each day, month or year.</div>', unsafe_allow_html=True)
     select_col, period_col = st.columns([3, 1.25], vertical_alignment='bottom')
     with select_col:
         selected = st.pills('Karat', options=available, default=[k for k in [21] if k in available] or available[:1], selection_mode='multi', format_func=lambda k: f'{k}K')
     with period_col:
-        interval = st.segmented_control('Interval', options=['Daily','Monthly','Yearly'], default='Daily')
+        interval = st.segmented_control('Interval', options=['All updates','Daily','Monthly','Yearly'], default='All updates')
     if not selected:
         st.info('Select at least one karat to display the chart.')
     else:
         selected_gold = gold[gold['karat'].isin(selected)].copy()
         selected_gold['local_date'] = selected_gold['collected_at'].dt.tz_convert('Africa/Cairo').dt.tz_localize(None)
-        period_rule = {'Daily':'D', 'Monthly':'MS', 'Yearly':'YS'}[interval]
-        selected_gold['period'] = selected_gold['local_date'].dt.to_period({'Daily':'D','Monthly':'M','Yearly':'Y'}[interval]).dt.to_timestamp()
-        plotted = (selected_gold.sort_values('collected_at')
-                   .groupby(['karat','period'], as_index=False).tail(1)
-                   .sort_values('period'))
+        if interval == 'All updates':
+            plotted = selected_gold.sort_values(['karat', 'collected_at']).copy()
+            plotted['period'] = plotted['collected_at'].dt.tz_convert('Africa/Cairo').dt.tz_localize(None)
+        else:
+            selected_gold['period'] = selected_gold['local_date'].dt.to_period(
+                {'Daily':'D','Monthly':'M','Yearly':'Y'}[interval]).dt.to_timestamp()
+            plotted = (selected_gold.sort_values('collected_at')
+                       .groupby(['karat','period'], as_index=False).tail(1)
+                       .sort_values(['karat','period']))
+        plotted['previous_price'] = plotted.groupby('karat')['effective_sell'].shift(1)
+        plotted['change_egp'] = plotted['effective_sell'] - plotted['previous_price']
+        plotted['change_pct'] = plotted['change_egp'] / plotted['previous_price'].replace(0, float('nan')) * 100
         fig = go.Figure()
         palette = ['#B8860B', '#6E8C75', '#8E7596', '#9E6F54', '#527E91']
         for i, k in enumerate(selected):
             df = plotted[plotted['karat'] == k]
             color = palette[i % len(palette)]
             fig.add_trace(go.Scatter(x=df['period'], y=df['effective_sell'], name=f'{k}K gold',
+                customdata=df[['change_egp','change_pct']].to_numpy(),
                 mode='lines+markers', line=dict(color=color, width=2), marker=dict(size=5),
-                fill='tozeroy' if len(selected) == 1 else None,
+                fill='tonexty' if False else None,
                 fillcolor='rgba(184,134,11,0.08)' if len(selected) == 1 else None,
-                hovertemplate='%{x|%b %d, %Y}<br><b>%{y:,.2f} EGP</b><extra>%{fullData.name}</extra>'))
+                hovertemplate='%{x|%d %b %Y, %H:%M}<br><b>%{y:,.2f} EGP</b><br>Change: %{customdata[0]:+,.2f} EGP (%{customdata[1]:+.2f}%)<extra>%{fullData.name}</extra>'))
             if len(df):
                 last = df.iloc[-1]
                 fig.add_annotation(x=last['period'], y=last['effective_sell'],
                     text=f"{last['effective_sell']:,.2f}", showarrow=False, yshift=18,
                     font=dict(size=12, color=color), bgcolor='#FFFFFF')
         style_history_chart(fig, interval, '#B8860B', 'EGP per gram')
-        fig.update_yaxes(tickformat=',.0f')
+        fig.update_yaxes(tickformat=',.0f', rangemode='normal')
+        if not plotted.empty:
+            lo, hi = plotted['effective_sell'].min(), plotted['effective_sell'].max()
+            pad = max((hi - lo) * 0.2, hi * 0.002, 1)
+            fig.update_yaxes(range=[lo - pad, hi + pad])
         st.plotly_chart(fig, use_container_width=True, config={'displayModeBar':False})
-        if len(plotted) == 1:
+        if all(len(plotted[plotted['karat'] == k]) == 1 for k in selected):
             st.caption('Only one observation so far. The line will appear as more days are collected.')
-        st.markdown('<div class="small-note">Historical prices use sell_price where available, otherwise price_per_gram. Each period shows its last recorded observation. Times are grouped by Cairo local date.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="small-note">All updates shows every stored observation. Daily, monthly and yearly show the last observation per period. Change on hover compares consecutive displayed observations, not necessarily official market closes. Cairo local time.</div>', unsafe_allow_html=True)
+        st.markdown('**Gold movement tracker**')
+        for k in selected:
+            series = plotted[plotted['karat'] == k].sort_values('period')
+            if series.empty:
+                continue
+            last_price = float(series.iloc[-1]['effective_sell'])
+            if len(series) > 1:
+                delta = last_price - float(series.iloc[-2]['effective_sell'])
+                pct = delta / float(series.iloc[-2]['effective_sell']) * 100 if float(series.iloc[-2]['effective_sell']) else 0
+                st.markdown(f'**{k}K:** {last_price:,.2f} EGP · {delta:+,.2f} EGP ({pct:+.2f}%) vs previous displayed observation')
+            else:
+                st.markdown(f'**{k}K:** {last_price:,.2f} EGP · No earlier observation in this view')
+        if interval == 'All updates':
+            st.caption(f'{len(plotted):,} collected gold observations shown, including repeated prices.')
     st.markdown('<div class="soft-divider"></div>', unsafe_allow_html=True)
     min_date = gold['collected_at'].dt.tz_convert('Africa/Cairo').min().date()
     max_date = gold['collected_at'].dt.tz_convert('Africa/Cairo').max().date()
@@ -345,11 +371,15 @@ with st.container(border=True):
         fx_period = usd_history.copy()
         fx_period['period'] = fx_period['observed_date'].dt.to_period({'Daily':'D','Monthly':'M','Yearly':'Y'}[fx_interval]).dt.to_timestamp()
         fx_period = fx_period.groupby('period', as_index=False).tail(1).sort_values('period')
+        fx_period['previous_rate'] = fx_period['usd_egp'].shift(1)
+        fx_period['change_egp'] = fx_period['usd_egp'] - fx_period['previous_rate']
+        fx_period['change_pct'] = fx_period['change_egp'] / fx_period['previous_rate'].replace(0, float('nan')) * 100
         fx_fig = go.Figure()
         fx_fig.add_trace(go.Scatter(x=fx_period['period'], y=fx_period['usd_egp'], name='USD / EGP',
+            customdata=fx_period[['change_egp','change_pct']].to_numpy(),
             mode='lines+markers', line=dict(color='#2F5D8A', width=2), marker=dict(size=6),
-            fill='tozeroy', fillcolor='rgba(47,93,138,0.08)',
-            hovertemplate='<b>%{x|%d %b %Y}</b><br>USD/EGP: %{y:,.4f} EGP<extra></extra>'))
+            fill=None,
+            hovertemplate='<b>%{x|%d %b %Y}</b><br>USD/EGP: %{y:,.4f} EGP<br>Change: %{customdata[0]:+,.4f} EGP (%{customdata[1]:+.2f}%)<extra></extra>'))
         if len(fx_period):
             last = fx_period.iloc[-1]
             fx_fig.add_annotation(x=last['period'], y=last['usd_egp'],
@@ -357,10 +387,19 @@ with st.container(border=True):
                 font=dict(size=12, color='#2F5D8A'), bgcolor='#FFFFFF')
         style_history_chart(fx_fig, fx_interval, '#2F5D8A', 'EGP per USD')
         fx_fig.update_yaxes(tickformat=',.2f')
+        fx_lo, fx_hi = fx_period['usd_egp'].min(), fx_period['usd_egp'].max()
+        fx_pad = max((fx_hi - fx_lo) * 0.2, fx_hi * 0.002, 0.01)
+        fx_fig.update_yaxes(range=[fx_lo - fx_pad, fx_hi + fx_pad])
         st.plotly_chart(fx_fig, use_container_width=True, config={'displayModeBar':False})
         if len(fx_period) == 1:
             st.caption('Only one observation so far. The line will appear as more days are collected.')
-        st.markdown('<div class="small-note">Daily snapshots are stored by the GitHub Actions USD collector. Monthly and yearly views show the last stored rate in each period.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="small-note">Daily USD rates are stored by the collector. Monthly and yearly views show the last stored rate in each period. Hover to inspect changes.</div>', unsafe_allow_html=True)
+        st.markdown('**USD / EGP movement tracker**')
+        if len(fx_period) > 1:
+            current, previous = float(fx_period.iloc[-1]['usd_egp']), float(fx_period.iloc[-2]['usd_egp'])
+            st.markdown(f'**Latest:** {current:,.4f} EGP · {current-previous:+,.4f} EGP ({(current-previous)/previous*100:+.2f}%) vs previous displayed observation' if previous else f'**Latest:** {current:,.4f} EGP')
+        else:
+            st.markdown(f'**Latest:** {float(fx_period.iloc[-1]["usd_egp"]):,.4f} EGP · No earlier stored observation')
     st.markdown('<div class="soft-divider"></div>', unsafe_allow_html=True)
     if usd_history.empty:
         st.caption('The download becomes available after the first USD collection.')
